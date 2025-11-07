@@ -1,0 +1,429 @@
+// Realtime Collaborative Text Editor: Design and Implementation using Yjs (CRDT) & WebSocket
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Realtime Collaborative Editor (Yjs + WebSocket)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{
+      --bg:#0f1724;
+      --card:#0b1220;
+      --muted:#9aa4b2;
+      --accent:#60a5fa;
+      --glass: rgba(255,255,255,0.03);
+      --white: #e6eef6;
+    }
+    html,body{height:100%;margin:0;background:linear-gradient(180deg,#071226,var(--bg));font-family: "Inter", "Segoe UI", Roboto, "Helvetica Neue", Arial; color:var(--white);}
+    .wrap{max-width:1100px;margin:28px auto;padding:20px;}
+    .grid{display:grid;grid-template-columns:320px 1fr;gap:18px;}
+    .panel{background:var(--card);border-radius:10px;padding:16px;box-shadow:0 6px 18px rgba(2,6,23,0.6);border:1px solid rgba(255,255,255,0.03);}
+    h1{margin:0;font-size:18px}
+    label{display:block;margin-top:12px;font-size:13px;color:var(--muted);}
+    input[type="text"], input[type="url"], select {
+      width:100%;padding:8px 10px;margin-top:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.06);
+      background:transparent;color:var(--white);outline:none;font-size:14px;
+    }
+    button{margin-top:12px;padding:8px 12px;border-radius:8px;border:0;background:linear-gradient(90deg,var(--accent),#3b82f6);color:#04263a;font-weight:600;cursor:pointer}
+    button.secondary{background:transparent;color:var(--accent);border:1px solid rgba(255,255,255,0.04)}
+    .status{display:flex;gap:8px;align-items:center;margin-top:8px}
+    .dot{width:10px;height:10px;border-radius:50%;}
+    .dot.connected{background:#34d399}
+    .dot.disconnected{background:#f97316}
+    .editor-wrap{position:relative;height:72vh;display:flex;flex-direction:column;}
+    .toolbar{display:flex;gap:8px;align-items:center;justify-content:space-between;}
+    .editor{
+      margin-top:12px;flex:1;border-radius:8px;padding:12px;overflow:auto;
+      background:var(--glass);border:1px solid rgba(255,255,255,0.03);
+      min-height:200px;outline:none;color:var(--white);font-size:15px;line-height:1.5;
+    }
+    .peer-list{margin-top:12px;display:flex;flex-direction:column;gap:8px;}
+    .peer{display:flex;gap:8px;align-items:center;padding:6px;border-radius:6px;background:rgba(255,255,255,0.02)}
+    .peer .avatar{width:12px;height:12px;border-radius:50%}
+    .footer-hint{font-size:12px;color:var(--muted);margin-top:8px}
+    pre.log{height:120px;overflow:auto;background:#021025;padding:8px;border-radius:6px;border:1px solid rgba(255,255,255,0.02);font-size:12px;color:var(--muted)}
+    @media (max-width:900px){
+      .grid{grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <h1>Realtime Collaborative Editor — Yjs (CRDT) + WebSocket</h1>
+      <div style="font-size:13px;color:var(--muted)">Demo • Single-file client</div>
+    </div>
+
+    <div class="grid">
+      <!-- Left panel: controls & presence -->
+      <div class="panel">
+        <label>WebSocket URL</label>
+        <input id="wsUrl" type="url" value="ws://localhost:1234" placeholder="wss://your-server.example/ws" />
+
+        <label>Document name</label>
+        <input id="docName" type="text" value="demo-document" placeholder="document name" />
+
+        <label>Username</label>
+        <input id="username" type="text" value="User" placeholder="Your display name" />
+
+        <label>Token (optional)</label>
+        <input id="token" type="text" placeholder="paste JWT token if server requires auth" />
+
+        <div style="display:flex;gap:8px;">
+          <button id="connectBtn">Connect</button>
+          <button id="disconnectBtn" class="secondary">Disconnect</button>
+        </div>
+
+        <div class="status">
+          <div id="connDot" class="dot disconnected"></div>
+          <div id="connStatus" style="color:var(--muted)">Disconnected</div>
+        </div>
+
+        <div style="margin-top:14px">
+          <label>Peers (presence)</label>
+          <div id="peers" class="peer-list">
+            <!-- dynamically filled -->
+          </div>
+        </div>
+
+        <div style="margin-top:12px">
+          <label>Log</label>
+          <pre id="log" class="log"></pre>
+        </div>
+
+        <div class="footer-hint">Open this page in multiple tabs (same doc name) to collaborate.</div>
+      </div>
+
+      <!-- Right panel: editor -->
+      <div class="panel editor-wrap">
+        <div class="toolbar">
+          <div style="display:flex;gap:8px;align-items:center">
+            <strong id="docTitle">Document: demo-document</strong>
+            <span style="color:var(--muted);font-size:13px;margin-left:8px" id="userBadge">— you: User</span>
+          </div>
+
+          <div>
+            <button id="clearBtn" class="secondary">Clear Local</button>
+            <button id="saveSnapshot">Save Snapshot (server)</button>
+          </div>
+        </div>
+
+        <div id="editor" class="editor" contenteditable="true" spellcheck="false" aria-label="Collaborative editor" />
+      </div>
+    </div>
+  </div>
+
+  <!-- Libraries from CDN -->
+  <script src="https://unpkg.com/yjs@13.8.12/dist/yjs.js"></script>
+  <script src="https://unpkg.com/y-websocket@1.4.5/dist/y-websocket.js"></script>
+
+  <script>
+    /************************************************************************
+     * Collaborative editor (Yjs + y-websocket)
+     * Single-file client (open in multiple tabs to test)
+     *
+     * Notes:
+     * - Change WS_URL to match your server. If server requires JWT, paste it in the Token field.
+     * - The editor binds a Y.Text called 'shared-text' to a contenteditable div.
+     * - Awareness publishes { user: { name, color }, selection } per client.
+     ************************************************************************/
+
+    (function(){
+      const Y = window.Y;
+      const { WebsocketProvider } = window['y-websocket'];
+
+      // UI elements
+      const wsUrlEl = document.getElementById('wsUrl');
+      const docNameEl = document.getElementById('docName');
+      const usernameEl = document.getElementById('username');
+      const tokenEl = document.getElementById('token');
+      const connectBtn = document.getElementById('connectBtn');
+      const disconnectBtn = document.getElementById('disconnectBtn');
+      const connDot = document.getElementById('connDot');
+      const connStatus = document.getElementById('connStatus');
+      const peersEl = document.getElementById('peers');
+      const logEl = document.getElementById('log');
+      const editorEl = document.getElementById('editor');
+      const docTitle = document.getElementById('docTitle');
+      const userBadge = document.getElementById('userBadge');
+      const clearBtn = document.getElementById('clearBtn');
+      const saveSnapshotBtn = document.getElementById('saveSnapshot');
+
+      let provider = null;
+      let ydoc = null;
+      let ytext = null;
+      let awareness = null;
+      let localColor = null;
+      let localName = null;
+
+      // small utility
+      function log(msg){
+        const time = new Date().toLocaleTimeString();
+        logEl.textContent = [${time}] ${msg}\n + logEl.textContent;
+      }
+
+      function setStatus(connected){
+        connDot.classList.toggle('connected', connected);
+        connDot.classList.toggle('disconnected', !connected);
+        connStatus.textContent = connected ? 'Connected' : 'Disconnected';
+      }
+
+      // generate a stable-ish color per session
+      function randomColor(seed){
+        // seed may be a string; hash simple
+        let h = 0;
+        for (let i=0;i<seed.length;i++) h = (h<<5)-h + seed.charCodeAt(i);
+        const hue = Math.abs(h) % 360;
+        return hsl(${hue} 68% 55%);
+      }
+
+      // Bind contenteditable <div> <-> Y.Text
+      function bindEditorToYText(ytext, el){
+        // apply remote updates to DOM
+        const applyRemote = () => {
+          const yVal = ytext.toString();
+          if (el.innerText !== yVal) {
+            // save caret
+            const sel = window.getSelection();
+            const range = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+            let startOffset = 0;
+            let endOffset = 0;
+            if (range) {
+              // best-effort: compute selection offsets relative to textContent
+              const preRange = document.createRange();
+              preRange.selectNodeContents(el);
+              preRange.setEnd(range.startContainer, Math.min(range.startOffset, range.startContainer.length || 0));
+              startOffset = preRange.toString().length;
+              preRange.setEnd(range.endContainer, Math.min(range.endOffset, range.endContainer.length || 0));
+              endOffset = preRange.toString().length;
+            }
+            el.innerText = yVal;
+            // restore caret roughly
+            placeCursor(el, startOffset, endOffset);
+          }
+        };
+
+        ytext.observe(() => {
+          applyRemote();
+        });
+
+        // initial load
+        el.innerText = ytext.toString();
+
+        // local edits -> update ytext (use transact to batch)
+        let localChange = false;
+        el.addEventListener('input', (e) => {
+          // To prevent feedback loops, mark localChange while applying local modifications
+          if (!ydoc) return;
+          const txt = el.innerText;
+          ydoc.transact(() => {
+            // Replace whole content — simple approach suitable for moderate docs.
+            // For higher performance, compute and apply deltas.
+            ytext.delete(0, ytext.length);
+            ytext.insert(0, txt);
+          }, { origin: 'editor' });
+        });
+      }
+
+      // Best-effort cursor placement inside contenteditable by character offsets
+      function placeCursor(containerEl, start, end){
+        containerEl.focus();
+        // create a new range
+        const range = document.createRange();
+        // Find text nodes and locate positions
+        let nodeStack = [containerEl], node, foundStart=false, charIndex=0, startNode=null, startOffset=0, endNode=null, endOffset=0;
+        while ((node = nodeStack.shift())) {
+          if (node.nodeType === 3) { // text node
+            const nextCharIndex = charIndex + node.textContent.length;
+            if (!foundStart && start >= charIndex && start <= nextCharIndex) {
+              startNode = node;
+              startOffset = start - charIndex;
+              foundStart = true;
+            }
+            if (end >= charIndex && end <= nextCharIndex) {
+              endNode = node;
+              endOffset = end - charIndex;
+              break;
+            }
+            charIndex = nextCharIndex;
+          } else {
+            // push children
+            for (let i=0;i<node.childNodes.length;i++) nodeStack.push(node.childNodes[i]);
+          }
+        }
+        if (startNode && endNode){
+          range.setStart(startNode, startOffset);
+          range.setEnd(endNode, endOffset);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+      }
+
+      // render peer list from awareness states
+      function renderPeers(aw){
+        const states = Array.from(aw.getStates().entries()); // [clientId, state]
+        peersEl.innerHTML = '';
+        for (const [clientId, state] of states){
+          if (!state.user) continue;
+          const div = document.createElement('div');
+          div.className = 'peer';
+          const avatar = document.createElement('span');
+          avatar.className = 'avatar';
+          avatar.style.background = state.user.color || '#999';
+          avatar.style.display = 'inline-block';
+          avatar.style.borderRadius = '50%';
+          avatar.style.width = '12px';
+          avatar.style.height = '12px';
+          const name = document.createElement('div');
+          name.textContent = state.user.name || 'Anonymous';
+          name.style.marginLeft = '8px';
+          name.style.fontSize = '13px';
+          name.style.color = 'var(--white)';
+          div.appendChild(avatar);
+          div.appendChild(name);
+          peersEl.appendChild(div);
+        }
+      }
+
+      // connect to server + set up awareness
+      function connect(){
+        const rawUrl = wsUrlEl.value.trim();
+        const docName = docNameEl.value.trim() || 'demo-document';
+        const username = (usernameEl.value.trim() || ('User' + Math.floor(Math.random()*1000)));
+        localName = username;
+        localColor = randomColor(username + Date.now());
+        const token = tokenEl.value.trim();
+        let url = rawUrl;
+        if (token) {
+          // append token as query param
+          const sep = url.includes('?') ? '&' : '?';
+          url += ${sep}token=${encodeURIComponent(token)};
+        }
+
+        // clean up any existing providers
+        if (provider) try { provider.disconnect(); } catch(e){}
+        if (ydoc) try { ydoc.destroy(); } catch(e){}
+
+        ydoc = new Y.Doc();
+        provider = new WebsocketProvider(url, docName, ydoc);
+
+        // optionally: configure provider options e.g. connect retries (left default)
+        ytext = ydoc.getText('shared-text');
+
+        awareness = provider.awareness;
+        awareness.setLocalStateField('user', { name: username, color: localColor });
+
+        // update UI labels
+        docTitle.textContent = 'Document: ' + docName;
+        userBadge.textContent = '— you: ' + username;
+
+        // connection status
+        provider.on('status', ev => {
+          setStatus(ev.status === 'connected');
+          log('WS status: ' + ev.status);
+        });
+
+        // sync complete / update log
+        provider.on('synced', () => {
+          log('Synced initial state for ' + docName);
+        });
+
+        // awareness changes (presence updates)
+        awareness.on('change', () => {
+          renderPeers(awareness);
+        });
+
+        // bind editor
+        bindEditorToYText(ytext, editorEl);
+
+        // Safety: initial focus in editor
+        setTimeout(()=> editorEl.focus(), 150);
+
+        log('Connected to ' + url + ' (doc: ' + docName + ')');
+      }
+
+      function disconnect(){
+        if (provider) {
+          provider.disconnect();
+          provider.destroy && provider.destroy();
+          provider = null;
+        }
+        if (ydoc) {
+          ydoc.destroy && ydoc.destroy();
+          ydoc = null;
+        }
+        setStatus(false);
+        log('Disconnected');
+      }
+
+      connectBtn.addEventListener('click', (e) => {
+        connect();
+      });
+
+      disconnectBtn.addEventListener('click', (e) => {
+        disconnect();
+      });
+
+      // clear local content (does not delete remote content on server)
+      clearBtn.addEventListener('click', () => {
+        if (!ydoc || !ytext) {
+          editorEl.innerText = '';
+          return;
+        }
+        ydoc.transact(() => {
+          ytext.delete(0, ytext.length);
+        });
+        editorEl.innerText = '';
+      });
+
+      // Save snapshot button: sends a POST to server snapshot endpoint
+      // This endpoint is server-specific. If you run the Node server provided earlier,
+      // you can implement an endpoint that accepts { docName, state }.
+      saveSnapshotBtn.addEventListener('click', async () => {
+        if (!ydoc || !ytext) {
+          alert('Not connected');
+          return;
+        }
+        // encode state update
+        const update = Y.encodeStateAsUpdate(ydoc);
+        const docName = docNameEl.value.trim() || 'demo-document';
+        const serverUrl = wsUrlEl.value.replace(/^ws/, 'http') + '/api/save-snapshot'; // default heuristic
+        try {
+          // Try to POST to server (if available). This is optional; if your server has a snapshot API use it.
+          const resp = await fetch(serverUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: update
+          });
+          if (resp.ok) {
+            log('Snapshot saved (server responded OK)');
+            alert('Snapshot saved on server (if supported).');
+          } else {
+            log('Snapshot endpoint returned ' + resp.status);
+            alert('Snapshot endpoint returned ' + resp.status + ' — check server API.');
+          }
+        } catch (err) {
+          log('Snapshot save failed: ' + err.message);
+          alert('Snapshot save failed: server may not support /api/save-snapshot. Check console log.');
+        }
+      });
+
+      // initialize default status
+      setStatus(false);
+
+      // make pressing Enter in username input update user name quickly
+      usernameEl.addEventListener('change', () => {
+        if (awareness) {
+          awareness.setLocalStateField('user', { name: usernameEl.value || localName, color: localColor });
+          userBadge.textContent = '— you: ' + (usernameEl.value || localName);
+        }
+      });
+
+      // optionally auto-connect on load (commented out)
+      // connect();
+    })();
+  </script>
+</body>
+</html>
